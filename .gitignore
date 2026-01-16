@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project-specific: Exclude large data files
+# PDF collections (users should provide their own)
+Journals/
+papers/
+paps/
+test_papers/
+*.pdf
+# BUT include My Papers folder for testing
+!My Papers/
+!My Papers/**/*.pdf
+
+# Results and output files
+*.xlsx
+# BUT include golden standard for evaluation
+!Golden Standard.xlsx
+
+# GROBID (users should install separately)
+grobid/
+
+# Documentation files (optional - remove if you want to include)
+*.docx
+
+# Jupyter notebooks (optional - remove if you want to include)
+*.ipynb
+
+# Environment variables
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+~$*
+

@@ -1,0 +1,26 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Secrets / editor
+.env
+.DS_Store
+.vscode/
+
+# Local papers and regenerable run output
+*.pdf
+output/
+.cache/
+grobid/
+pipeline_run_stats.json
+
+# Excel outputs (keep the gold labels only)
+*.xlsx
+!data/gold/Gold Standard.xlsx

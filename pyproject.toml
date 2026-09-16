@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "efficient-extraction-pipeline"
+version = "0.1.0"
+description = "GROBID / NLP / LLM / AlphaMind scholarly PDF metadata extraction pipelines"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Joshua Owusu Ansah" }]
+dependencies = [
+  "pandas>=2.2.3,<3",
+  "numpy>=1.23.0,<2.1",
+  "openpyxl>=3.0.0",
+  "requests>=2.28.0",
+  "lxml>=4.9.0",
+  "python-dotenv>=0.21.0",
+  "PyMuPDF>=1.21.0",
+  "pdfminer.six>=20221105",
+  "tqdm>=4.64.0",
+  "openai>=1.0.0",
+  "spacy>=3.4.0,<3.8",
+  "click>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+alphamind-extract = "alphamind_extractor:main"
+grobid-extract = "grobid_pipeline:main"
+compare-pipelines = "compare_pipelines:main"
+extraction-preflight = "preflight_check:main"
+
+[tool.setuptools]
+py-modules = [
+  "alphamind_extractor",
+  "grobid_pipeline",
+  "LLM_extraction_pipeline",
+  "NPL_extraction_pipeline",
+  "pipeline_paths",
+  "compare_pipelines",
+  "preflight_check",
+]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

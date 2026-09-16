@@ -1,0 +1,13 @@
+# Pipeline-only dependencies (also declared in pyproject.toml)
+pandas>=2.2.3,<3
+numpy>=1.23.0,<2.1
+openpyxl>=3.0.0
+requests>=2.28.0
+lxml>=4.9.0
+python-dotenv>=0.21.0
+PyMuPDF>=1.21.0
+pdfminer.six>=20221105
+tqdm>=4.64.0
+openai>=1.0.0
+spacy>=3.4.0,<3.8
+click>=8.0.0

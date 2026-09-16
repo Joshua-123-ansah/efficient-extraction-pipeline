@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Compare Pipelines (Gold vs GROBID / NLP / LLM / JoshColey)
+Compare Pipelines (Gold vs GROBID / NLP / LLM / AlphaMind Extractor)
 
 What this script does:
 - Reads your gold-standard Excel and pipeline outputs (same/similar columns).
@@ -25,8 +25,29 @@ import json
 import time
 import subprocess
 import argparse
+import unicodedata
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from pipeline_paths import (  # noqa: E402
+    EVAL_DIR,
+    EVAL_SUMMARY_XLSX as _EVAL_SUMMARY_XLSX,
+    GOLD_XLSX as _GOLD_XLSX,
+    GROBID_RESULTS_XLSX as _GROBID_RESULTS_XLSX,
+    ALPHAMIND_EXTRACTOR_RESULTS_XLSX as _ALPHAMIND_EXTRACTOR_RESULTS_XLSX,
+    JOSHCOLEY_RESULTS_XLSX as _JOSHCOLEY_RESULTS_XLSX,
+    LLM_RESULTS_XLSX as _LLM_RESULTS_XLSX,
+    MY_PAPERS,
+    NLP_RESULTS_XLSX as _NLP_RESULTS_XLSX,
+    OUTPUT_DIR,
+    PIPELINES_DIR,
+    PIPELINE_RUN_STATS_JSON as _PIPELINE_RUN_STATS_JSON,
+    ensure_runtime_dirs,
+)
+ensure_runtime_dirs()
 
 import pandas as pd
 import numpy as np
@@ -37,11 +58,17 @@ from difflib import SequenceMatcher
 # -----------------------------
 
 # Defaults (can override via env or CLI args)
-GOLD_XLSX   = os.environ.get("GOLD_XLSX",   "Golden Standard.xlsx")
-GROBID_XLSX = os.environ.get("GROBID_XLSX", "grobid_results_v4.xlsx")
-NLP_XLSX    = os.environ.get("NLP_XLSX",    "nlp_results.xlsx")
-LLM_XLSX    = os.environ.get("LLM_XLSX",    "llm_results.xlsx")
-JOSHCOLEY_XLSX = os.environ.get("JOSHCOLEY_XLSX", "joshcoley_results.xlsx")
+GOLD_XLSX   = os.environ.get("GOLD_XLSX",   str(_GOLD_XLSX))
+GROBID_XLSX = os.environ.get("GROBID_XLSX", str(_GROBID_RESULTS_XLSX))
+NLP_XLSX    = os.environ.get("NLP_XLSX",    str(_NLP_RESULTS_XLSX))
+LLM_XLSX    = os.environ.get("LLM_XLSX",    str(_LLM_RESULTS_XLSX))
+HYBRID_PIPELINE_LABEL = "AlphaMind Extractor"
+_HYBRID_RUN_ALIASES = frozenset({"joshcoley", "alphamind_extractor", "alphamind"})
+
+JOSHCOLEY_XLSX = os.environ.get(
+    "ALPHAMIND_EXTRACTOR_XLSX",
+    os.environ.get("JOSHCOLEY_XLSX", str(_ALPHAMIND_EXTRACTOR_RESULTS_XLSX)),
+)
 
 # Column used to match records across files
 ID_COL = os.environ.get("MATCH_ID_COL", "Title")
@@ -71,10 +98,10 @@ TITLE_MATCH_THRESHOLD = float(os.environ.get("TITLE_MATCH_THRESHOLD", "0.93"))
 
 # Optional export
 EXPORT_SUMMARY = os.environ.get("COMPARE_EXPORT", "1") not in ("0", "false", "False")
-SUMMARY_XLSX = os.environ.get("SUMMARY_XLSX", "pipeline_evaluation_summary.xlsx")
+SUMMARY_XLSX = os.environ.get("SUMMARY_XLSX", str(_EVAL_SUMMARY_XLSX))
 
 # Optional time/cost stats file (JSON). If absent, scripts estimate/minimize.
-RUN_STATS_JSON = os.environ.get("RUN_STATS_JSON", "pipeline_run_stats.json")
+RUN_STATS_JSON = os.environ.get("RUN_STATS_JSON", str(_PIPELINE_RUN_STATS_JSON))
 
 # Cost estimation fallback (only used if stats missing for LLM)
 # Very rough: tokens ~= chars/4. Price per 1K tokens default.
@@ -85,14 +112,51 @@ LLM_COST_PER_1K_TOKENS = float(os.environ.get("LLM_COST_PER_1K_TOKENS", "0.002")
 # 1) HELPERS
 # -----------------------------
 
+_AFFIL_STOP = frozenset({
+    "a", "an", "and", "at", "in", "of", "the", "to", "for",
+    "usa", "us", "uk", "ca", "ny", "tx", "fl", "mi",
+    "correspondence",
+})
+_GLUED_ORG = re.compile(
+    r"([a-z])(university|universiteit|tech|college|institute|state)\b"
+)
+_CORRESPONDENCE = re.compile(r"\bcorrespondence\b.*$", re.I | re.S)
+_EMAIL = re.compile(r"\S+@\S+")
+_ZIP = re.compile(r"\b\d{5}(?:-\d{4})?\b")
+_MAIL_CODE = re.compile(r"\b(?:mc|mail\s*code)\s*\d+\b", re.I)
+
+
 def normalize_text(s: str) -> str:
     if pd.isna(s):
         return ""
-    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFKC", str(s)).replace("\u2013", "-").replace("\u2014", "-")
+    s = s.strip().lower()
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def normalize_affiliation(s: str) -> str:
+    """Scoring-only: drop postal/correspondence noise; keep institution wording."""
+    if pd.isna(s):
+        return ""
+    text = unicodedata.normalize("NFKC", str(s))
+    text = _CORRESPONDENCE.sub(" ", text)
+    text = _EMAIL.sub(" ", text)
+    text = _MAIL_CODE.sub(" ", text)
+    text = _ZIP.sub(" ", text)
+    text = normalize_text(text)
+    text = _GLUED_ORG.sub(r"\1 \2", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _token_coverage(gold: str, pred: str) -> float:
+    gt = {t for t in gold.split() if t not in _AFFIL_STOP}
+    pt = {t for t in pred.split() if t not in _AFFIL_STOP}
+    if not gt:
+        return 1.0 if not pt else 0.0
+    return len(gt & pt) / len(gt)
 
 def to_int_or_nan(x):
     try:
@@ -102,6 +166,8 @@ def to_int_or_nan(x):
 
 def ratio(a: str, b: str) -> float:
     a, b = normalize_text(a), normalize_text(b)
+    if not a and not b:
+        return 1.0
     return SequenceMatcher(None, a, b).ratio()
 
 
@@ -110,9 +176,14 @@ def field_similarity(field: str, gold_val, pred_val) -> float:
         g = to_int_or_nan(gold_val)
         p = to_int_or_nan(pred_val)
         return 1.0 if (not np.isnan(g) and not np.isnan(p) and g == p) else 0.0
-    if field == "Abstract":
-        return ratio(gold_val, pred_val)
-    # Default for text fields
+    if field == "Affiliation":
+        g = normalize_affiliation(gold_val)
+        p = normalize_affiliation(pred_val)
+        if not g and not p:
+            return 1.0
+        if not g or not p:
+            return 0.0
+        return max(SequenceMatcher(None, g, p).ratio(), _token_coverage(g, p))
     return ratio(gold_val, pred_val)
 
 def is_correct(field: str, gold_val, pred_val, thresholds: Dict[str, float]) -> bool:
@@ -138,6 +209,25 @@ def load_df(path: str) -> pd.DataFrame:
 # -----------------------------
 # 2) RECORD LINKAGE (File Path first, then Title fallback)
 # -----------------------------
+
+def _same_person(a: str, b: str) -> bool:
+    """
+    Loose author identity for record linkage only (not for scoring).
+
+    Gold and pipelines render the same person differently ("Jerrod A. Henderson"
+    vs "Jerrod Henderson"), so require the surname to agree and the given names
+    to agree or be initial-compatible.
+    """
+    at, bt = a.split(), b.split()
+    if not at or not bt:
+        return False
+    if at[-1] != bt[-1]:
+        return False
+    af, bf = at[0], bt[0]
+    if af == bf:
+        return True
+    return af[0] == bf[0] and (len(af) == 1 or len(bf) == 1)
+
 
 def link_records(gold_df: pd.DataFrame, pred_df: pd.DataFrame, title_threshold: float) -> Dict[int, int]:
     """
@@ -175,7 +265,33 @@ def link_records(gold_df: pd.DataFrame, pred_df: pd.DataFrame, title_threshold: 
     if has_file_path:
         gold_paths = gold_df["File Path"].fillna("").apply(normalize_path).tolist()
         pred_paths = pred_df["File Path"].fillna("").apply(normalize_path).tolist()
-        
+
+        # Pass 0: File Path AND Target Author.
+        #
+        # 8 of the 43 gold papers carry more than one target-author row. Matching
+        # on File Path alone lets the first gold row for a paper claim whichever
+        # pred row for that paper comes first, so e.g. Ebony O. McGee's gold row
+        # gets scored against Monica L. Miles's prediction. Bind the author too.
+        if "Target Author" in gold_df.columns and "Target Author" in pred_df.columns:
+            gold_auth = gold_df["Target Author"].fillna("").apply(normalize_text).tolist()
+            pred_auth = pred_df["Target Author"].fillna("").apply(normalize_text).tolist()
+            for gi in range(len(gold_df)):
+                gp = gold_paths[gi] if gi < len(gold_paths) else ""
+                ga = gold_auth[gi] if gi < len(gold_auth) else ""
+                if not gp or not ga:
+                    continue
+                for pi in range(len(pred_df)):
+                    if pi in used_pred:
+                        continue
+                    pp = pred_paths[pi] if pi < len(pred_paths) else ""
+                    pa = pred_auth[pi] if pi < len(pred_auth) else ""
+                    same_file = (pp and gp == pp) or (
+                        pp and Path(gp).name.lower() == Path(pp).name.lower())
+                    if same_file and pa and _same_person(ga, pa):
+                        mapping[gi] = pi
+                        used_pred.add(pi)
+                        break
+
         # Try exact path match first
         for gi in range(len(gold_df)):
             gold_path = gold_paths[gi] if gi < len(gold_paths) else ""
@@ -333,12 +449,19 @@ def side_by_side_table(grobid_metrics: pd.DataFrame, nlp_metrics: pd.DataFrame, 
         keep = df[["Field", "Precision", "Recall", "F1"]].copy()
         keep["Pipeline"] = name
         return keep
-    long = pd.concat([
-        prep(grobid_metrics, "GROBID"),
-        prep(nlp_metrics,    "NLP/ML"),
-        prep(llm_metrics,    "LLM"),
-        prep(joshcoley_metrics, "JoshColey")
-    ], ignore_index=True)
+    chunks = [
+        prep(df, name)
+        for df, name in (
+            (grobid_metrics, "GROBID"),
+            (nlp_metrics, "NLP/ML"),
+            (llm_metrics, "LLM"),
+            (joshcoley_metrics, HYBRID_PIPELINE_LABEL),
+        )
+        if df is not None
+    ]
+    if not chunks:
+        return pd.DataFrame()
+    long = pd.concat(chunks, ignore_index=True)
     wide = (long
             .pivot(index="Field", columns="Pipeline", values=["Precision", "Recall", "F1"]))
     if fields_order:
@@ -361,12 +484,18 @@ def overall_table(grobid_metrics: pd.DataFrame, nlp_metrics: pd.DataFrame, llm_m
             ("Micro-Recall", name):      micro_rec,
             ("Micro-F1", name):          micro_f1
         })
-    row = pd.concat([
-        overall_from(grobid_metrics, grobid_summary, "GROBID"),
-        overall_from(nlp_metrics,    nlp_summary,    "NLP/ML"),
-        overall_from(llm_metrics,    llm_summary,    "LLM"),
-        overall_from(joshcoley_metrics, joshcoley_summary, "JoshColey"),
-    ])
+    series = []
+    for df, summary, name in (
+        (grobid_metrics, grobid_summary, "GROBID"),
+        (nlp_metrics, nlp_summary, "NLP/ML"),
+        (llm_metrics, llm_summary, "LLM"),
+        (joshcoley_metrics, joshcoley_summary, HYBRID_PIPELINE_LABEL),
+    ):
+        if df is not None and summary is not None:
+            series.append(overall_from(df, summary, name))
+    if not series:
+        return pd.DataFrame()
+    row = pd.concat(series)
     out = (row.to_frame(name="value")
               .reset_index()
               .rename(columns={"level_0": "Metric", "level_1": "Pipeline"})
@@ -385,7 +514,7 @@ def overall_sentence(overall_tbl: pd.DataFrame) -> str:
         return f"{v:.3f}"
     
     # Find the pipeline with the best Macro-F1 score
-    pipelines = ["GROBID", "LLM", "NLP/ML", "JoshColey"]
+    pipelines = ["GROBID", "LLM", "NLP/ML", HYBRID_PIPELINE_LABEL]
     best_pipeline = None
     best_f1 = -1.0
     for pipe in pipelines:
@@ -396,7 +525,10 @@ def overall_sentence(overall_tbl: pd.DataFrame) -> str:
                 best_pipeline = pipe
     
     if best_pipeline is None:
-        best_pipeline = "GROBID"  # Fallback
+        cols = [p for p in pipelines if p in overall_tbl.columns]
+        if not cols:
+            return "No pipeline metrics to summarize."
+        best_pipeline = cols[0]
     
     # Build the sentence with best pipeline first
     parts = []
@@ -404,10 +536,16 @@ def overall_sentence(overall_tbl: pd.DataFrame) -> str:
         if pipe in overall_tbl.columns:
             parts.append(f"{pipe} at {g('Macro-Precision',pipe)}/{g('Macro-Recall',pipe)}/{g('Macro-F1',pipe)}")
     
+    score = (
+        f"{g('Macro-Precision',best_pipeline)}/{g('Macro-Recall',best_pipeline)}/{g('Macro-F1',best_pipeline)}"
+    )
+    others = [p for p in parts if not p.startswith(best_pipeline)]
+    if not others:
+        return f"Overall, {best_pipeline} was best with Macro Precision/Recall/F1 of {score}."
     return (
-        f"Overall, {best_pipeline} was best with Macro Precision/Recall/F1 of "
-        f"{g('Macro-Precision',best_pipeline)}/{g('Macro-Recall',best_pipeline)}/{g('Macro-F1',best_pipeline)}, "
-        f"compared to " + ", ".join([p for p in parts if not p.startswith(best_pipeline)]) + ".")
+        f"Overall, {best_pipeline} was best with Macro Precision/Recall/F1 of {score}, "
+        f"compared to " + ", ".join(others) + "."
+    )
 
 def per_field_sentences(sxs: pd.DataFrame) -> List[str]:
     lines = []
@@ -468,12 +606,12 @@ def time_cost_table(grobid_df: pd.DataFrame, nlp_df: pd.DataFrame, llm_df: pd.Da
     grobid = stats.get("grobid", {})
     nlp    = stats.get("nlp", {})
     llm    = stats.get("llm", {})
-    joshcoley = stats.get("joshcoley", {})
+    hybrid = stats.get("alphamind_extractor") or stats.get("joshcoley", {})
     # Defaults
     grobid_time = grobid.get("runtime_seconds", np.nan)
     nlp_time    = nlp.get("runtime_seconds", np.nan)
     llm_time    = llm.get("runtime_seconds", np.nan)
-    joshcoley_time = joshcoley.get("runtime_seconds", np.nan)
+    joshcoley_time = hybrid.get("runtime_seconds", np.nan)
 
     # Override with measured times if provided
     if measured_times:
@@ -483,8 +621,10 @@ def time_cost_table(grobid_df: pd.DataFrame, nlp_df: pd.DataFrame, llm_df: pd.Da
             nlp_time = measured_times.get("nlp", nlp_time)
         if "llm" in measured_times:
             llm_time = measured_times.get("llm", llm_time)
-        if "joshcoley" in measured_times:
-            joshcoley_time = measured_times.get("joshcoley", joshcoley_time)
+        if "alphamind_extractor" in measured_times or "joshcoley" in measured_times:
+            joshcoley_time = measured_times.get(
+                "alphamind_extractor", measured_times.get("joshcoley", joshcoley_time)
+            )
 
     grobid_cost = grobid.get("cost_usd", 0.0)
     nlp_cost    = nlp.get("cost_usd", 0.0)
@@ -494,19 +634,19 @@ def time_cost_table(grobid_df: pd.DataFrame, nlp_df: pd.DataFrame, llm_df: pd.Da
         # Estimate if not present
         llm_cost = estimate_llm_cost_from_outputs(llm_df, LLM_COST_PER_1K_TOKENS)
     
-    # Estimate JoshColey cost: GROBID (free) + LLM cost for Affiliation only
-    # Since JoshColey uses LLM only for Affiliation, estimate cost as a fraction of full LLM cost
-    # Rough estimate: if LLM extracts all fields, JoshColey uses LLM for 1/7 fields (Affiliation only)
+    # Estimate AlphaMind Extractor cost: GROBID (free) + LLM cost for Affiliation only
+    # Since the hybrid uses LLM only for Affiliation, estimate cost as a fraction of full LLM cost
+    # Rough estimate: if LLM extracts all fields, hybrid uses LLM for 1/7 fields (Affiliation only)
     # But LLM prompt includes all fields, so estimate based on proportional usage
     # Conservative estimate: ~30% of LLM cost (since we only need Affiliation but still run full LLM extraction)
-    if "cost_usd" in joshcoley:
-        joshcoley_cost = joshcoley.get("cost_usd", 0.0)
+    if "cost_usd" in hybrid:
+        joshcoley_cost = hybrid.get("cost_usd", 0.0)
     else:
         # Estimate: GROBID is free, LLM cost for Affiliation only
         # Since we run full LLM extraction but only use Affiliation, estimate as ~30% of LLM cost
         joshcoley_cost = llm_cost * 0.3
     
-    # Estimate JoshColey time: GROBID time + LLM time (since we run both)
+    # Estimate hybrid time: GROBID time + LLM time (since we run both)
     if pd.isna(joshcoley_time):
         if not pd.isna(grobid_time) and not pd.isna(llm_time):
             # Conservative: sum of both (sequential processing)
@@ -517,7 +657,7 @@ def time_cost_table(grobid_df: pd.DataFrame, nlp_df: pd.DataFrame, llm_df: pd.Da
             joshcoley_time = llm_time
 
     tbl = pd.DataFrame({
-        "Pipeline": ["GROBID", "NLP/ML", "LLM", "JoshColey"],
+        "Pipeline": ["GROBID", "NLP/ML", "LLM", HYBRID_PIPELINE_LABEL],
         "Time (s)": [grobid_time, nlp_time, llm_time, joshcoley_time],
         "Cost (USD)": [grobid_cost, nlp_cost, llm_cost, joshcoley_cost],
     })
@@ -535,12 +675,23 @@ def main():
     parser.add_argument("grobid", nargs="?", help="Path to grobid Excel", default=None)
     parser.add_argument("nlp", nargs="?", help="Path to nlp Excel", default=None)
     parser.add_argument("llm", nargs="?", help="Path to llm Excel", default=None)
-    parser.add_argument("joshcoley", nargs="?", help="Path to joshcoley Excel", default=None)
+    parser.add_argument("joshcoley", nargs="?", help="Path to AlphaMind Extractor Excel (legacy arg name)", default=None)
     parser.add_argument("--run", action="store_true", help="Run pipelines before comparing and measure time")
-    parser.add_argument("--run-which", default="all", help="Which pipelines to run: all or comma list (grobid,nlp,llm,joshcoley)")
+    parser.add_argument("--run-which", default="all", help="Which pipelines to run: all or comma list (grobid,nlp,llm,alphamind_extractor)")
     parser.add_argument("--root", default=None, help="Root folder to pass to pipelines (optional)")
     parser.add_argument("--authors", default=None, help="Comma-separated authors to pass to pipelines (optional)")
     parser.add_argument("--llm-ok", action="store_true", help="Confirm permission to run the LLM pipeline (costs may apply)")
+    cons = parser.add_mutually_exclusive_group()
+    cons.add_argument(
+        "--consolidate-header",
+        action="store_true",
+        help="Kept for compatibility; CrossRef/biblio-glutton header consolidation is already the default",
+    )
+    cons.add_argument(
+        "--no-consolidate-header",
+        action="store_true",
+        help="Disable GROBID header consolidation (PDF-only metadata)",
+    )
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("PIPELINE_RUN_TIMEOUT", "3600")), help="Per-pipeline timeout in seconds")
     args_ns = parser.parse_args()
 
@@ -554,18 +705,29 @@ def main():
     measured_times: Dict[str, float] = {}
     if args_ns.run:
         which = args_ns.run_which.strip().lower()
-        to_run = {"grobid", "nlp", "llm", "joshcoley"} if which == "all" else {w.strip() for w in which.split(",") if w.strip()}
+        if which == "all":
+            to_run = {"grobid", "nlp", "llm", "alphamind_extractor"}
+        else:
+            to_run = set()
+            for w in which.split(","):
+                tag = w.strip().lower()
+                if not tag:
+                    continue
+                to_run.add("alphamind_extractor" if tag in _HYBRID_RUN_ALIASES else tag)
         # helper to run and time
-        def run_and_time(tag: str, script: Path) -> None:
+        def run_and_time(tag: str, script: Path, env: Optional[dict] = None) -> None:
             cmd: List[str] = [sys.executable, str(script)]
             if args_ns.root:
                 cmd.append(args_ns.root)
             if args_ns.authors:
                 cmd.append(args_ns.authors)
             t0 = time.perf_counter()
+            run_env = os.environ.copy()
+            if env:
+                run_env.update(env)
             try:
                 print(f"▶ Running {tag}…")
-                subprocess.run(cmd, check=False, timeout=args_ns.timeout)
+                proc = subprocess.run(cmd, check=False, timeout=args_ns.timeout, cwd=str(_ROOT), env=run_env)
             except subprocess.TimeoutExpired:
                 print(f"⏱️ {tag} timed out after {args_ns.timeout}s")
                 measured_times[tag] = np.nan
@@ -574,66 +736,109 @@ def main():
                 print(f"❌ {tag} run failed: {e}")
                 measured_times[tag] = np.nan
                 return
+            if getattr(proc, "returncode", 0) not in (0, None):
+                print(f"❌ {tag} exited with code {proc.returncode}")
+                measured_times[tag] = np.nan
+                return
             dt = time.perf_counter() - t0
             measured_times[tag] = round(dt, 3)
             print(f"✅ {tag} finished in {dt:.1f}s")
 
-        project_root = Path(__file__).parent
+        project_root = _ROOT
+        EVAL_DIR.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env.setdefault("ROOT_PAPERS_DIR", str(MY_PAPERS))
+        env.setdefault("OUTPUT_XLSX", str(_GROBID_RESULTS_XLSX))
+        if args_ns.no_consolidate_header:
+            env["CONSOLIDATE_HEADER"] = "0"
+            print("ℹ️ GROBID header consolidation OFF (PDF only)")
+        else:
+            env["CONSOLIDATE_HEADER"] = "1"
+            print("ℹ️ GROBID header consolidation ON (CrossRef / biblio-glutton)")
         if "grobid" in to_run:
-            run_and_time("grobid", project_root / "grobid_extraction_v4.py")
+            run_and_time("grobid", PIPELINES_DIR / "grobid_pipeline.py", env=env)
+        env["OUTPUT_XLSX"] = str(_NLP_RESULTS_XLSX)
         if "nlp" in to_run:
-            run_and_time("nlp", project_root / "NPL_extraction_pipeline.py")
+            run_and_time("nlp", PIPELINES_DIR / "NPL_extraction_pipeline.py", env=env)
+        env["OUTPUT_XLSX"] = str(_LLM_RESULTS_XLSX)
         if "llm" in to_run:
             if args_ns.llm_ok:
-                run_and_time("llm", project_root / "LLM_extraction_pipeline.py")
+                run_and_time("llm", PIPELINES_DIR / "LLM_extraction_pipeline.py", env=env)
             else:
                 print("ℹ️ Skipping LLM run (missing --llm-ok)")
-        if "joshcoley" in to_run:
+        env["OUTPUT_XLSX"] = str(_ALPHAMIND_EXTRACTOR_RESULTS_XLSX)
+        if "alphamind_extractor" in to_run:
             if args_ns.llm_ok:
-                run_and_time("joshcoley", project_root / "joshcoley_extraction_pipeline.py")
+                run_and_time("alphamind_extractor", PIPELINES_DIR / "alphamind_extractor.py", env=env)
             else:
-                print("ℹ️ Skipping JoshColey run (missing --llm-ok, requires LLM)")
+                print("ℹ️ Skipping AlphaMind Extractor run (missing --llm-ok, requires LLM)")
 
-    for p in [gold_path, grobid_path, nlp_path, llm_path, joshcoley_path]:
-        if not p.exists():
-            print(f"❌ Missing input: {p}")
-            sys.exit(1)
+    if not gold_path.exists():
+        print(f"❌ Missing gold standard: {gold_path}")
+        sys.exit(1)
 
-    gold   = load_df(str(gold_path))
-    grobid = load_df(str(grobid_path))
-    nlp    = load_df(str(nlp_path))
-    llm    = load_df(str(llm_path))
-    joshcoley = load_df(str(joshcoley_path))
+    gold = load_df(str(gold_path))
+    empty = pd.DataFrame()
 
-    grobid_metrics, grobid_summary = evaluate_pipeline(gold, grobid, FIELDS, TITLE_MATCH_THRESHOLD)
-    nlp_metrics,    nlp_summary    = evaluate_pipeline(gold, nlp,    FIELDS, TITLE_MATCH_THRESHOLD)
-    llm_metrics,    llm_summary    = evaluate_pipeline(gold, llm,    FIELDS, TITLE_MATCH_THRESHOLD)
-    joshcoley_metrics, joshcoley_summary = evaluate_pipeline(gold, joshcoley, FIELDS, TITLE_MATCH_THRESHOLD)
+    def _load_optional(label: str, path: Path):
+        if path.exists():
+            df = load_df(str(path))
+            metrics, summary = evaluate_pipeline(gold, df, FIELDS, TITLE_MATCH_THRESHOLD)
+            return df, metrics, summary
+        print(f"ℹ️ Skipping {label}: missing {path}")
+        return None, None, None
 
-    # Add macro/micro rows (per-pipeline sheets)
-    grobid_full = add_micro_macro_rows(grobid_metrics, "GROBID")
-    nlp_full    = add_micro_macro_rows(nlp_metrics,    "NLP/ML")
-    llm_full    = add_micro_macro_rows(llm_metrics,    "LLM")
-    joshcoley_full = add_micro_macro_rows(joshcoley_metrics, "JoshColey")
+    grobid, grobid_metrics, grobid_summary = _load_optional("GROBID", grobid_path)
+    nlp, nlp_metrics, nlp_summary = _load_optional("NLP/ML", nlp_path)
+    llm, llm_metrics, llm_summary = _load_optional("LLM", llm_path)
+    joshcoley, joshcoley_metrics, joshcoley_summary = _load_optional(
+        HYBRID_PIPELINE_LABEL, joshcoley_path
+    )
 
-    # Side-by-side per-field
+    present = [
+        name for name, df in (
+            ("GROBID", grobid),
+            ("NLP/ML", nlp),
+            ("LLM", llm),
+            (HYBRID_PIPELINE_LABEL, joshcoley),
+        )
+        if df is not None
+    ]
+    if not present:
+        print("❌ No pipeline result files found under data/evaluation/. Run a pipeline first.")
+        sys.exit(1)
+
+    grobid_full = add_micro_macro_rows(grobid_metrics, "GROBID") if grobid_metrics is not None else None
+    nlp_full = add_micro_macro_rows(nlp_metrics, "NLP/ML") if nlp_metrics is not None else None
+    llm_full = add_micro_macro_rows(llm_metrics, "LLM") if llm_metrics is not None else None
+    joshcoley_full = (
+        add_micro_macro_rows(joshcoley_metrics, HYBRID_PIPELINE_LABEL)
+        if joshcoley_metrics is not None else None
+    )
+
     sxs = side_by_side_table(grobid_metrics, nlp_metrics, llm_metrics, joshcoley_metrics, fields_order=FIELDS)
-
-    # Overall compact
     overall_tbl = overall_table(grobid_metrics, nlp_metrics, llm_metrics, joshcoley_metrics,
                                 grobid_summary, nlp_summary, llm_summary, joshcoley_summary)
+    tc_tbl = time_cost_table(
+        grobid if grobid is not None else empty,
+        nlp if nlp is not None else empty,
+        llm if llm is not None else empty,
+        joshcoley if joshcoley is not None else empty,
+        measured_times=measured_times if measured_times else None,
+    )
 
-    # Time & Cost
-    tc_tbl = time_cost_table(grobid, nlp, llm, joshcoley, measured_times=measured_times if measured_times else None)
+    coverage_row = {}
+    if grobid_summary is not None:
+        coverage_row["GROBID"] = [grobid_summary["coverage"]]
+    if nlp_summary is not None:
+        coverage_row["NLP/ML"] = [nlp_summary["coverage"]]
+    if llm_summary is not None:
+        coverage_row["LLM"] = [llm_summary["coverage"]]
+    if joshcoley_summary is not None:
+        coverage_row[HYBRID_PIPELINE_LABEL] = [joshcoley_summary["coverage"]]
 
-    # PRINT REPORT
     print("=== COVERAGE (papers found / total gold) ===")
-    print(pd.DataFrame({
-        "GROBID": [grobid_summary["coverage"]],
-        "NLP/ML": [nlp_summary["coverage"]],
-        "LLM":    [llm_summary["coverage"]],
-        "JoshColey": [joshcoley_summary["coverage"]],
-    }, index=["Coverage"]).round(3))
+    print(pd.DataFrame(coverage_row, index=["Coverage"]).round(3))
     print()
 
     print("=== OVERALL (Macro & Micro) ===")
@@ -656,29 +861,23 @@ def main():
     for line in per_field_sentences(sxs):
         print("-", line)
 
-    # EXPORT
     if EXPORT_SUMMARY:
         try:
             with pd.ExcelWriter(SUMMARY_XLSX) as writer:
-                # Coverage
                 pd.DataFrame({
-                    "Pipeline": ["GROBID", "NLP/ML", "LLM", "JoshColey"],
-                    "Coverage": [grobid_summary["coverage"], nlp_summary["coverage"], llm_summary["coverage"], joshcoley_summary["coverage"]],
+                    "Pipeline": list(coverage_row.keys()),
+                    "Coverage": [v[0] for v in coverage_row.values()],
                 }).to_excel(writer, sheet_name="Coverage", index=False)
-
-                # Per-pipeline per-field (with averages)
-                grobid_full.to_excel(writer, sheet_name="GROBID_per_field", index=False)
-                nlp_full.to_excel(writer,    sheet_name="NLP_per_field",    index=False)
-                llm_full.to_excel(writer,    sheet_name="LLM_per_field",    index=False)
-                joshcoley_full.to_excel(writer, sheet_name="JoshColey_per_field", index=False)
-
-                # Side-by-side per-field
+                if grobid_full is not None:
+                    grobid_full.to_excel(writer, sheet_name="GROBID_per_field", index=False)
+                if nlp_full is not None:
+                    nlp_full.to_excel(writer, sheet_name="NLP_per_field", index=False)
+                if llm_full is not None:
+                    llm_full.to_excel(writer, sheet_name="LLM_per_field", index=False)
+                if joshcoley_full is not None:
+                    joshcoley_full.to_excel(writer, sheet_name="AlphaMind_Extractor_per_field", index=False)
                 sxs.to_excel(writer, sheet_name="SideBySide_PerField")
-
-                # Overall macro/micro compact table
                 overall_tbl.to_excel(writer, sheet_name="Overall_MacroMicro")
-
-                # Time & Cost
                 tc_tbl.to_excel(writer, sheet_name="Time_Cost", index=False)
             print(f"✅ Wrote summary to {SUMMARY_XLSX}")
         except Exception as e:

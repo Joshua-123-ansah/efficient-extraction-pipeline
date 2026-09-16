@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any, Tuple
 import unicodedata
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
@@ -28,7 +29,7 @@ except Exception:
 
 # Optional engines for PDF text
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
 except Exception:
     fitz = None
 try:
@@ -50,9 +51,13 @@ except Exception:
     raise
 
 # -------------------- CONFIG --------------------
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from pipeline_paths import LLM_RESULTS_XLSX, MY_PAPERS
 
 # Root folder variable (can be changed):
-ROOT_FOLDER: Path = Path(os.environ.get("ROOT_PAPERS_DIR", "My Papers")).expanduser().resolve()
+ROOT_FOLDER: Path = Path(os.environ.get("ROOT_PAPERS_DIR", str(MY_PAPERS))).expanduser().resolve()
 
 # Target authors variable (can be changed): reuse your list for fair comparison
 TARGET_AUTHORS: List[str] = [
@@ -81,22 +86,78 @@ TARGET_AUTHORS: List[str] = [
 ]
 
 # Output Excel file:
-OUTPUT_XLSX: Path = Path(os.environ.get("OUTPUT_XLSX", "llm_results.xlsx")).resolve()
+OUTPUT_XLSX: Path = Path(os.environ.get("OUTPUT_XLSX", str(LLM_RESULTS_XLSX))).resolve()
 
 # Concurrency: be conservative for API rate-limits
 MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "2"))
 
 # Heuristics / limits
-SCAN_FIRST_N_PAGES_FOR_BYLINE = int(os.environ.get("HEAD_PAGES", "3"))
+# Two pages, not three. Measured on 422 PDFs (42 gold + 380 JEE) by locating the
+# Abstract heading and the following Introduction/Keywords marker against real
+# page boundaries: the title -> authors -> abstract region closes within page 1
+# for 417 of them and within page 2 for all 422. Not one paper needed page 3,
+# which was ~36% of the input bill. Override with HEAD_PAGES if a corpus with
+# unusually long front matter turns up.
+SCAN_FIRST_N_PAGES_FOR_BYLINE = int(os.environ.get("HEAD_PAGES", "2"))
 EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
 DOI_RE = re.compile(r'\b10\.\d{4,9}/\S+\b', re.I)
 
-ABSTRACT_HDR = r'(Abstract|Summary|Résumé|Resumé|Zusammenfassung|Resumen|Резюме|摘要|概要|초록|ملخص)'
-KEYWORDS_HDR = r'(Keywords?|Index Terms|Mots[- ]clés|Palabras clave|Schlüsselwörter|Ключевые слова|关键词)'
+# Non-capturing: these are embedded in larger patterns whose group(1) is
+# meant to be the BODY text. As capturing groups they shifted every index,
+# so abstract/keyword extraction returned the literal word "Abstract".
+ABSTRACT_HDR = r'(?:Abstract|Summary|Résumé|Resumé|Zusammenfassung|Resumen|Резюме|摘要|概要|초록|ملخص)'
+KEYWORDS_HDR = r'(?:Keywords?|Index Terms|Mots[- ]clés|Palabras clave|Schlüsselwörter|Ключевые слова|关键词)'
 
-# OpenAI
+# -------------------- LLM provider (ASU CreateAI) --------------------
+# Kept identical to alphamind_extractor.py so the two pipelines are
+# compared on the same gateway, model and pricing.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "createai").strip().lower()
+CREATEAI_BASE_URL = os.environ.get("CREATEAI_BASE_URL", "https://api-main.aiml.asu.edu/v1").rstrip('/')
+
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "60"))
+
+
+def get_llm_api_key() -> str:
+    """Bearer token for the configured provider (CreateAI service token or OpenAI key)."""
+    if LLM_PROVIDER == "createai":
+        for var in ("CREATEAI_API_KEY", "ASU_CREATE_AI_KEY"):
+            key = os.environ.get(var, "").strip()
+            if key:
+                return key
+    return os.environ.get("OPENAI_API_KEY", "").strip()
+
+# Pricing and stats (per 1M tokens) for cost tracking
+# Must match alphamind_extractor.py or the cost comparison is invalid.
+# Derived from a real CreateAI response: 801 input tokens billed at $0.004005
+# => $5.00 / 1M input. Confirm the output rate from usage_metric.output_token_cost.
+OPENAI_INPUT_PRICE_PER_M = float(os.environ.get("OPENAI_INPUT_PRICE_PER_M", "5.00"))
+OPENAI_OUTPUT_PRICE_PER_M = float(os.environ.get("OPENAI_OUTPUT_PRICE_PER_M", "15.00"))
+
+# Path shared with compare_pipelines.py for time/cost reporting
+RUN_STATS_JSON = os.environ.get("RUN_STATS_JSON", "pipeline_run_stats.json")
+
+# Global usage accumulator (guarded by a lock because of ThreadPoolExecutor)
+_LLM_USAGE = {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "cost_usd": 0.0,
+}
+_LLM_USAGE_LOCK = threading.Lock()
+
+
+def _update_llm_usage(prompt_tokens: Optional[int], completion_tokens: Optional[int]) -> None:
+    """Accumulate token usage and cost for this run."""
+    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
+        return
+    call_cost = (
+        (prompt_tokens / 1_000_000.0) * OPENAI_INPUT_PRICE_PER_M
+        + (completion_tokens / 1_000_000.0) * OPENAI_OUTPUT_PRICE_PER_M
+    )
+    with _LLM_USAGE_LOCK:
+        _LLM_USAGE["prompt_tokens"] += prompt_tokens
+        _LLM_USAGE["completion_tokens"] += completion_tokens
+        _LLM_USAGE["cost_usd"] += call_cost
 
 # -------------------- Utilities --------------------
 
@@ -126,7 +187,9 @@ def initials_from_given(given_tokens: List[str]) -> List[str]:
 # -------------------- TARGET AUTHOR ABBREVIATION --------------------
 
 def parse_name_for_abbrev(name: str) -> Tuple[str, List[str], str]:
-    n = normalize_spaces(name)
+    # Strip suffixes first: "James Holly, Jr." must not be read as
+    # Last="James Holly", First="Jr." by the "Last, First" branch below.
+    n = strip_name_suffix(name)
     if not n:
         return '', [], ''
     if ',' in n:
@@ -170,7 +233,7 @@ def abbreviate_targets(targets: List[str]) -> List[str]:
 # -------------------- Name comparison --------------------
 
 def extract_first_last(name: str) -> Tuple[str, str]:
-    n = normalize_spaces(name)
+    n = strip_name_suffix(name)
     if not n:
         return '', ''
     if ',' in n:
@@ -190,15 +253,48 @@ def extract_first_last(name: str) -> Tuple[str, str]:
         return tokens[0], ''
     return tokens[0], tokens[-1]
 
+# Generational/credential suffixes are not part of a person's name and must be
+# stripped before first/last extraction, otherwise "James Holly, Jr." parses as
+# first="Jr", last="Holly".
+NAME_SUFFIX_RE = re.compile(
+    r"[,\s]+(jr|sr|ii|iii|iv|v|phd|ph\.d|md|m\.d|dr|prof)\.?\s*$", re.I)
+
+
+def strip_name_suffix(s: str) -> str:
+    prev = None
+    out = normalize_spaces(s)
+    while prev != out:
+        prev = out
+        out = normalize_spaces(NAME_SUFFIX_RE.sub('', out))
+    return out
+
+
 def normalize_name_for_compare_robust(s: str) -> str:
     if not s:
         return ''
     t = normalize_spaces(s).lower()
     t = strip_accents(t)
-    t = re.sub(r'[^\w\-\']', '', t)
+    # Drop apostrophes and hyphens too: "Na'ilah" and "Nailah", "Boyd-Sinkler"
+    # and "Boyd Sinkler" are the same person in a byline.
+    t = re.sub(r"[^\w]", '', t)
     return t
 
+def _is_initials(raw: str, norm: str) -> bool:
+    """True if a given-name field is an initial form: "B", "B.", "B.A.", "B. A."."""
+    if len(norm) == 1:
+        return True
+    compact = re.sub(r'\s+', '', (raw or '').lower())
+    return bool(re.fullmatch(r'(?:[a-z]\.){1,3}', compact))
+
 def robust_author_match(target: str, found: str) -> bool:
+    """
+    Match two renderings of the same author.
+
+    Surnames must agree exactly. Given names agree if they are equal, or if
+    either side is an initial that starts the other -- journals routinely print
+    "B. Coley" for "Brooke Coley", and requiring full equality silently drops
+    those papers.
+    """
     if not target or not found:
         return False
     t_first, t_last = extract_first_last(target)
@@ -209,7 +305,14 @@ def robust_author_match(target: str, found: str) -> bool:
     t_last_norm = normalize_name_for_compare_robust(t_last)
     f_first_norm = normalize_name_for_compare_robust(f_first)
     f_last_norm = normalize_name_for_compare_robust(f_last)
-    return t_first_norm == f_first_norm and t_last_norm == f_last_norm
+    if not t_last_norm or t_last_norm != f_last_norm:
+        return False
+    if t_first_norm == f_first_norm:
+        return True
+    # Initial vs full given name. "B." and "B.A." are both initial forms.
+    if _is_initials(t_first, t_first_norm) or _is_initials(f_first, f_first_norm):
+        return bool(t_first_norm) and bool(f_first_norm) and t_first_norm[0] == f_first_norm[0]
+    return False
 
 # -------------------- PDF text helpers --------------------
 
@@ -300,17 +403,50 @@ def slice_abstract_full(text: str) -> str:
         return normalize_spaces(m_abs_intro.group(1))
     return ''
 
-def build_llm_prompt(head_text: str, byline_text: str, abstract_candidate: str) -> str:
+def _text_key(s: str) -> str:
+    """Punctuation- and whitespace-insensitive key, for containment checks.
+
+    byline_block() rebuilds its output by joining normalised lines with single
+    spaces, so the byline is never a *literal* substring of head_text even
+    though it carries no new characters. Compare on this key instead.
+    """
+    s = re.sub(r'[^\w\s]', ' ', (s or '').lower())
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def build_llm_prompt(head_text: str, byline_text: str) -> str:
+    """Build prompt from head text and byline. Abstract is in HEAD_TEXT; model extracts it.
+
+    byline_text is carved out of head_text by byline_block(), so emitting both
+    shipped the same characters twice -- measured at ~1,480 chars/paper
+    (~10.6% of total input tokens) on the 43-paper gold corpus. Send
+    BYLINE_TEXT only when it carries material HEAD_TEXT does not; otherwise
+    point the model at the byline region in one sentence, which costs ~15
+    tokens instead of ~370.
+    """
+    duplicate = bool(byline_text) and _text_key(byline_text) in _text_key(head_text)
+
+    sections: List[str] = []
+    if byline_text and not duplicate:
+        sections.append(f"BYLINE_TEXT:\n{byline_text}")
+    if head_text:
+        sections.append(f"HEAD_TEXT:\n{head_text}")
+    body = "\n\n".join(sections)
+
+    byline_hint = (
+        "The author byline appears at the start of HEAD_TEXT, above the Abstract heading. "
+        if duplicate else ""
+    )
+
     return (
         "You are a meticulous scientific metadata extractor. "
         "Given raw text from the beginning of a scientific article, extract structured metadata. "
+        + byline_hint +
         "Return STRICT JSON with keys: title (string), authors (array of strings, full names), "
         "affiliations (array of objects: {author: str, affiliations: array[str]}), emails (array of objects: {author: str, emails: array[str]}), "
         "abstract (string, full, do not truncate), keywords (string), journal (string), volume (string), issue (string), pages (string), year (string), doi (string). "
         "If a field is unknown, use an empty string or empty array.\n\n"
-        f"BYLINE_TEXT:\n{byline_text}\n\n"
-        f"HEAD_TEXT:\n{head_text}\n\n"
-        f"ABSTRACT_CANDIDATE_FROM_REGEX (use if plausible):\n{abstract_candidate}\n\n"
+        f"{body}\n\n"
         "Output JSON only."
     )
 
@@ -332,15 +468,18 @@ def try_parse_json(s: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-def call_openai_extract(head_text: str, byline_text: str, abstract_candidate: str) -> Optional[Dict[str, Any]]:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+def call_openai_extract(head_text: str, byline_text: str) -> Optional[Dict[str, Any]]:
+    api_key = get_llm_api_key()
     if not api_key:
         return None
-    prompt = build_llm_prompt(head_text, byline_text, abstract_candidate)
+    prompt = build_llm_prompt(head_text, byline_text)
     # Prefer new SDK interface, fallback to legacy if needed
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+        client_kwargs: Dict[str, Any] = {"api_key": api_key}
+        if LLM_PROVIDER == "createai":
+            client_kwargs["base_url"] = CREATEAI_BASE_URL
+        client = OpenAI(**client_kwargs)
         try:
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -352,6 +491,11 @@ def call_openai_extract(head_text: str, byline_text: str, abstract_candidate: st
                 timeout=OPENAI_TIMEOUT,
                 response_format={"type": "json_object"},
             )
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                prompt_toks = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)
+                completion_toks = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)
+                _update_llm_usage(prompt_toks, completion_toks)
             content = resp.choices[0].message.content if resp.choices else ''
             return try_parse_json(content)
         except Exception:
@@ -365,6 +509,11 @@ def call_openai_extract(head_text: str, byline_text: str, abstract_candidate: st
                 temperature=0,
                 timeout=OPENAI_TIMEOUT,
             )
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                prompt_toks = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)
+                completion_toks = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)
+                _update_llm_usage(prompt_toks, completion_toks)
             content = resp.choices[0].message.content if resp.choices else ''
             return try_parse_json(content)
     except Exception:
@@ -380,6 +529,11 @@ def call_openai_extract(head_text: str, byline_text: str, abstract_candidate: st
                 temperature=0,
                 request_timeout=OPENAI_TIMEOUT,
             )
+            usage = resp.get("usage") if isinstance(resp, dict) else getattr(resp, "usage", None)
+            if usage:
+                prompt_toks = usage.get("prompt_tokens") if isinstance(usage, dict) else getattr(usage, "prompt_tokens", None)
+                completion_toks = usage.get("completion_tokens") if isinstance(usage, dict) else getattr(usage, "completion_tokens", None)
+                _update_llm_usage(prompt_toks, completion_toks)
             content = resp["choices"][0]["message"]["content"] if resp and resp.get("choices") else ''
             return try_parse_json(content)
         except Exception:
@@ -409,7 +563,7 @@ def extract_from_pdf_llm(pdf_path: Path) -> Dict[str, Any]:
         "doi": ""
     }
 
-    result = call_openai_extract(head_text or '', by, abstract_candidate)
+    result = call_openai_extract(head_text or '', by)
     if not result:
         # Minimal fallback: regex-heuristic similar to NLP pipeline to avoid empty rows
         md = md_default.copy()
@@ -525,8 +679,13 @@ def main():
         sys.exit(1)
 
     # Report OpenAI availability (single line, like Grobid)
-    openai_ok = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    print(f"🤖 OpenAI available: {'YES (model=' + OPENAI_MODEL + ')' if openai_ok else 'NO (will use fallback)'}")
+    openai_ok = bool(get_llm_api_key())
+    if openai_ok:
+        target = CREATEAI_BASE_URL if LLM_PROVIDER == "createai" else "https://api.openai.com"
+        print(f"🤖 LLM available: YES (provider={LLM_PROVIDER}, model={OPENAI_MODEL}, endpoint={target})")
+    else:
+        want = "ASU_CREATE_AI_KEY" if LLM_PROVIDER == "createai" else "OPENAI_API_KEY"
+        print(f"🤖 LLM available: NO — set {want} (will use fallback)")
 
     pdfs = gather_pdfs(root)
     print(f"📄 Found {len(pdfs)} PDF(s) under {root}")
@@ -596,6 +755,7 @@ def main():
 
     # Parallel processing for speed
     processed = 0
+    failed: List[Tuple[str, str]] = []
     if MAX_WORKERS > 1 and len(candidates) > 1:
         iterator = None
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -605,18 +765,30 @@ def main():
                 try:
                     rs = fut.result()
                     rows.extend(rs)
-                except Exception:
-                    pass
+                except Exception as e:
+                    failed.append((futures[fut].name, f"{type(e).__name__}: {e}"))
                 processed += 1
     else:
         iterable = tqdm(candidates, desc='Processing', unit='pdf') if tqdm else candidates
         for p in iterable:
-            rows.extend(process_one(p))
+            # Serial path had no guard: one unreadable PDF aborted the whole run.
+            try:
+                rows.extend(process_one(p))
+            except Exception as e:
+                failed.append((p.name, f"{type(e).__name__}: {e}"))
             processed += 1
 
     dt = time.time() - t0
     rate = (processed / dt) if dt > 0 else 0
     print(f"⏱️ Done in {dt:.1f}s ({rate:.2f} pdf/s). Matched rows: {len(rows)}")
+    if failed:
+        # Previously these were swallowed silently, so a run could quietly drop
+        # papers and still look successful.
+        print(f"⚠️  {len(failed)} PDF(s) failed to process:")
+        for nm, err in failed[:10]:
+            print(f"     {nm}: {err}")
+        if len(failed) > 10:
+            print(f"     ... and {len(failed)-10} more")
 
     if not rows:
         print("ℹ️ No matching papers/authors found; nothing to write.")
@@ -631,6 +803,28 @@ def main():
         print(f"✅ Wrote {len(df)} rows to {OUTPUT_XLSX}")
     except Exception as e:
         print(f"❌ Failed to write Excel: {e}")
+
+    # Persist runtime and LLM cost/usage for compare_pipelines.py
+    try:
+        stats_path = Path(RUN_STATS_JSON)
+        if stats_path.exists():
+            with stats_path.open("r", encoding="utf-8") as f:
+                stats = json.load(f)
+        else:
+            stats = {}
+        with _LLM_USAGE_LOCK:
+            usage_snapshot = dict(_LLM_USAGE)
+        stats["llm"] = {
+            "runtime_seconds": round(dt, 3),
+            "cost_usd": round(usage_snapshot.get("cost_usd", 0.0), 6),
+            "prompt_tokens": int(usage_snapshot.get("prompt_tokens", 0)),
+            "completion_tokens": int(usage_snapshot.get("completion_tokens", 0)),
+        }
+        with stats_path.open("w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+        print(f"💰 Recorded LLM stats in {stats_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to write LLM stats: {e}")
 
 if __name__ == "__main__":
     main()

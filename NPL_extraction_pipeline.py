@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Optional engines for PDF text
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
 except Exception:
     fitz = None
 try:
@@ -41,9 +41,13 @@ except Exception:
     raise
 
 # -------------------- CONFIG --------------------
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from pipeline_paths import MY_PAPERS, NLP_RESULTS_XLSX, PIPELINE_RUN_STATS_JSON
 
 # Root folder variable (can be changed):
-ROOT_FOLDER: Path = Path(os.environ.get("ROOT_PAPERS_DIR", "My Papers")).expanduser().resolve()
+ROOT_FOLDER: Path = Path(os.environ.get("ROOT_PAPERS_DIR", str(MY_PAPERS))).expanduser().resolve()
 
 # Target authors variable (can be changed):
 TARGET_AUTHORS: List[str] = [
@@ -71,8 +75,11 @@ TARGET_AUTHORS: List[str] = [
     'Tanya Ennis', 'Geraldine Cochran', 'Yolanda Rankin', 'John Palmore'
 ]
 
+# Path shared with compare_pipelines.py for time/cost reporting
+RUN_STATS_JSON = os.environ.get("RUN_STATS_JSON", str(PIPELINE_RUN_STATS_JSON))
+
 # Output Excel file:
-OUTPUT_XLSX: Path = Path(os.environ.get("OUTPUT_XLSX", "nlp_results.xlsx")).resolve()
+OUTPUT_XLSX: Path = Path(os.environ.get("OUTPUT_XLSX", str(NLP_RESULTS_XLSX))).resolve()
 # Optional worker count for concurrency
 MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "4"))
 
@@ -81,8 +88,11 @@ SCAN_FIRST_N_PAGES_FOR_BYLINE = 3
 EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
 DOI_RE = re.compile(r'\b10\.\d{4,9}/\S+\b', re.I)
 
-ABSTRACT_HDR = r'(Abstract|Summary|Résumé|Resumé|Zusammenfassung|Resumen|Резюме|摘要|概要|초록|ملخص)'
-KEYWORDS_HDR = r'(Keywords?|Index Terms|Mots[- ]clés|Palabras clave|Schlüsselwörter|Ключевые слова|关键词)'
+# Non-capturing: these are embedded in larger patterns whose group(1) is
+# meant to be the BODY text. As capturing groups they shifted every index,
+# so abstract/keyword extraction returned the literal word "Abstract".
+ABSTRACT_HDR = r'(?:Abstract|Summary|Résumé|Resumé|Zusammenfassung|Resumen|Резюме|摘要|概要|초록|ملخص)'
+KEYWORDS_HDR = r'(?:Keywords?|Index Terms|Mots[- ]clés|Palabras clave|Schlüsselwörter|Ключевые слова|关键词)'
 
 # Common affiliation keywords for heuristics
 AFFILIATION_HINTS = (
@@ -118,7 +128,9 @@ def initials_from_given(given_tokens: List[str]) -> List[str]:
 # -------------------- TARGET AUTHOR ABBREVIATION --------------------
 
 def parse_name_for_abbrev(name: str) -> Tuple[str, List[str], str]:
-    n = normalize_spaces(name)
+    # Strip suffixes first: "James Holly, Jr." must not be read as
+    # Last="James Holly", First="Jr." by the "Last, First" branch below.
+    n = strip_name_suffix(name)
     if not n:
         return '', [], ''
     if ',' in n:
@@ -162,7 +174,7 @@ def abbreviate_targets(targets: List[str]) -> List[str]:
 # -------------------- Name comparison --------------------
 
 def extract_first_last(name: str) -> Tuple[str, str]:
-    n = normalize_spaces(name)
+    n = strip_name_suffix(name)
     if not n:
         return '', ''
     if ',' in n:
@@ -182,15 +194,48 @@ def extract_first_last(name: str) -> Tuple[str, str]:
         return tokens[0], ''
     return tokens[0], tokens[-1]
 
+# Generational/credential suffixes are not part of a person's name and must be
+# stripped before first/last extraction, otherwise "James Holly, Jr." parses as
+# first="Jr", last="Holly".
+NAME_SUFFIX_RE = re.compile(
+    r"[,\s]+(jr|sr|ii|iii|iv|v|phd|ph\.d|md|m\.d|dr|prof)\.?\s*$", re.I)
+
+
+def strip_name_suffix(s: str) -> str:
+    prev = None
+    out = normalize_spaces(s)
+    while prev != out:
+        prev = out
+        out = normalize_spaces(NAME_SUFFIX_RE.sub('', out))
+    return out
+
+
 def normalize_name_for_compare_robust(s: str) -> str:
     if not s:
         return ''
     t = normalize_spaces(s).lower()
     t = strip_accents(t)
-    t = re.sub(r'[^\w\-\']', '', t)
+    # Drop apostrophes and hyphens too: "Na'ilah" and "Nailah", "Boyd-Sinkler"
+    # and "Boyd Sinkler" are the same person in a byline.
+    t = re.sub(r"[^\w]", '', t)
     return t
 
+def _is_initials(raw: str, norm: str) -> bool:
+    """True if a given-name field is an initial form: "B", "B.", "B.A.", "B. A."."""
+    if len(norm) == 1:
+        return True
+    compact = re.sub(r'\s+', '', (raw or '').lower())
+    return bool(re.fullmatch(r'(?:[a-z]\.){1,3}', compact))
+
 def robust_author_match(target: str, found: str) -> bool:
+    """
+    Match two renderings of the same author.
+
+    Surnames must agree exactly. Given names agree if they are equal, or if
+    either side is an initial that starts the other -- journals routinely print
+    "B. Coley" for "Brooke Coley", and requiring full equality silently drops
+    those papers.
+    """
     if not target or not found:
         return False
     t_first, t_last = extract_first_last(target)
@@ -201,7 +246,14 @@ def robust_author_match(target: str, found: str) -> bool:
     t_last_norm = normalize_name_for_compare_robust(t_last)
     f_first_norm = normalize_name_for_compare_robust(f_first)
     f_last_norm = normalize_name_for_compare_robust(f_last)
-    return t_first_norm == f_first_norm and t_last_norm == f_last_norm
+    if not t_last_norm or t_last_norm != f_last_norm:
+        return False
+    if t_first_norm == f_first_norm:
+        return True
+    # Initial vs full given name. "B." and "B.A." are both initial forms.
+    if _is_initials(t_first, t_first_norm) or _is_initials(f_first, f_first_norm):
+        return bool(t_first_norm) and bool(f_first_norm) and t_first_norm[0] == f_first_norm[0]
+    return False
 
 # -------------------- spaCy model --------------------
 
@@ -638,6 +690,7 @@ def main():
 
     # Parallel processing for speed
     processed = 0
+    failed: List[Tuple[str, str]] = []
     if MAX_WORKERS > 1 and len(candidates) > 1:
         iterator = None
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -647,18 +700,30 @@ def main():
                 try:
                     rs = fut.result()
                     rows.extend(rs)
-                except Exception:
-                    pass
+                except Exception as e:
+                    failed.append((futures[fut].name, f"{type(e).__name__}: {e}"))
                 processed += 1
     else:
         iterable = tqdm(candidates, desc='Processing', unit='pdf') if tqdm else candidates
         for p in iterable:
-            rows.extend(process_one(p))
+            # Serial path had no guard: one unreadable PDF aborted the whole run.
+            try:
+                rows.extend(process_one(p))
+            except Exception as e:
+                failed.append((p.name, f"{type(e).__name__}: {e}"))
             processed += 1
 
     dt = time.time() - t0
     rate = (processed / dt) if dt > 0 else 0
     print(f"⏱️ Done in {dt:.1f}s ({rate:.2f} pdf/s). Matched rows: {len(rows)}")
+    if failed:
+        # Previously these were swallowed silently, so a run could quietly drop
+        # papers and still look successful.
+        print(f"⚠️  {len(failed)} PDF(s) failed to process:")
+        for nm, err in failed[:10]:
+            print(f"     {nm}: {err}")
+        if len(failed) > 10:
+            print(f"     ... and {len(failed)-10} more")
 
     if not rows:
         print("ℹ️ No matching papers/authors found; nothing to write.")
@@ -673,6 +738,22 @@ def main():
         print(f"✅ Wrote {len(df)} rows to {OUTPUT_XLSX}")
     except Exception as e:
         print(f"❌ Failed to write Excel: {e}")
+
+    # Record runtime so compare_pipelines.py can show a complete Time column.
+    # Without this, NLP's time was always NaN in the comparison table.
+    try:
+        import json as _json
+        stats_path = Path(RUN_STATS_JSON)
+        stats = {}
+        if stats_path.exists():
+            with stats_path.open("r", encoding="utf-8") as f:
+                stats = _json.load(f)
+        stats["nlp"] = {"runtime_seconds": round(dt, 3), "cost_usd": 0.0}
+        with stats_path.open("w", encoding="utf-8") as f:
+            _json.dump(stats, f, indent=2)
+        print(f"⏱️  Recorded NLP stats in {stats_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to write NLP stats: {e}")
 
 if __name__ == "__main__":
     main()

@@ -47,6 +47,10 @@ try:
 except Exception:
     pdfminer_extract_text = None
 
+# PyMuPDF is not thread-safe. Callers that extract papers in parallel threads
+# must hold this lock around every fitz document; it is shared with callers.
+_PDF_LOCK = threading.Lock()
+
 # Optional progress bar
 try:
     from tqdm.auto import tqdm
@@ -416,7 +420,7 @@ def robust_author_match(target: str, found: str) -> bool:
 def pdf_text_all(pdf_path: Path) -> str:
     if fitz is not None:
         try:
-            with fitz.open(pdf_path) as doc:
+            with _PDF_LOCK, fitz.open(pdf_path) as doc:
                 return "\n".join(page.get_text("text") for page in doc)
         except Exception:
             pass
@@ -430,7 +434,7 @@ def pdf_text_all(pdf_path: Path) -> str:
 def pdf_text_first_n(pdf_path: Path, n_pages: int) -> str:
     if fitz is not None:
         try:
-            with fitz.open(pdf_path) as doc:
+            with _PDF_LOCK, fitz.open(pdf_path) as doc:
                 n = min(n_pages, len(doc))
                 return "\n".join(doc[i].get_text("text") for i in range(n))
         except Exception:
@@ -454,7 +458,7 @@ def pdf_text_byline_window(pdf_path: Path) -> str:
     if fitz is None:
         return pdf_text_first_n(pdf_path, SCAN_FIRST_N_PAGES_FOR_BYLINE)
     try:
-        with fitz.open(pdf_path) as doc:
+        with _PDF_LOCK, fitz.open(pdf_path) as doc:
             if len(doc) == 0:
                 return ""
             page1 = doc[0].get_text("text")

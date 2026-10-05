@@ -1,0 +1,34 @@
+# When the extraction package updates, rebuild Articlyst on the Droplet
+# so web/worker pick up the new git+https dependency.
+#
+# Secrets (same as articlyst, or duplicate them here):
+#   DROPLET_HOST, DROPLET_USER, DROPLET_SSH_KEY
+
+name: Redeploy Articlyst Droplet
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: articlyst-droplet-from-pipeline
+  cancel-in-progress: false
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild Articlyst (pulls latest pipeline into image)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script_stop: true
+          command_timeout: 45m
+          script: |
+            set -euo pipefail
+            cd /opt/articlyst
+            chmod +x scripts/droplet-update.sh
+            PIPELINE_REF=main ./scripts/droplet-update.sh "pipeline push ${{ github.sha }}"

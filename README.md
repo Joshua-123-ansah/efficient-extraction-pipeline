@@ -54,6 +54,17 @@ python scripts/compare_pipelines.py --run --run-which grobid
 python scripts/compare_pipelines.py --run --run-which grobid --no-consolidate-header
 ```
 
+## Confidence routing
+
+The hybrid extractor runs GROBID on every paper and calls the LLM for affiliations only when GROBID's affiliations fail a rule-based check. Each affiliation must:
+
+- be non-empty and 12–300 characters long (`GATE_MIN_CHARS`, `GATE_MAX_CHARS`)
+- be a single affiliation, not several joined with `;` (`GATE_MAX_SEGMENTS`)
+- not repeat itself (e.g. "Purdue University Purdue University")
+- name an institution (university, college, institute of technology, polytechnic, academy, or school)
+
+If any affiliation on a paper fails, that paper goes to the LLM. Set `ROUTE_ON_GROBID_CONFIDENCE=0` to send every paper to the LLM.
+
 ## Consumers
 
 Apps such as the Space Lab / AlphaMind web platform should depend on this package rather than vendoring these files. When you push updates here, those apps pick them up with `pip install -U …`.
